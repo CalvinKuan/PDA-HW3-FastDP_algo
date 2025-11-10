@@ -32,7 +32,9 @@ clean:
 #   make run
 # -------------------------------
 run1: $(TARGET)
-	@$(TARGET) ../testcase/public1.lef ../testcase/public1.def $(OUT_DIR)/public1_out.def
+	@$(TARGET) ../testcase/public1.lef ../testcase/public1.def $(OUT_DIR)/public1.def
+run2 : $(TARGET)
+	@$(TARGET) ../testcase/public4.lef ../testcase/public4.def $(OUT_DIR)/public4.def
 
 run: $(TARGET)
 	@echo "▶ Running all DEF/LEF testcases..."
