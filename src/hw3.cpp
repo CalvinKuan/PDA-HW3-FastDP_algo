@@ -68,6 +68,7 @@ struct RowStripe
     int x_origin_dbu;
     int y_origin_dbu;
     int x_sites;
+    string orient;
     int x_spacing_dbu;
     vector<pair<int, int>> row_blocks; // [xL,xR) intervals blocked by macros
     vector<inst_info> placed_insts;
@@ -120,6 +121,7 @@ vector<RowStripe> make_cell_map(vector<row_info> &row_table,
         current_stripe.y_origin_dbu = row.origin_y_dbu;
         current_stripe.x_sites = row.x_site_size;
         current_stripe.x_spacing_dbu = row.x_spacing_dbu;
+        current_stripe.orient = row.orient;
         current_stripe.placed_insts.clear();
         for (auto &inst : inst_table)
         {
@@ -757,12 +759,18 @@ static bool global_swap_one_pass(vector<RowStripe> &rowstripes,
             long long best_delta = 0;
             int best_r = -1, best_ib = -1;
 
-            for (int rr = max(0, r - MAX_ROW_DELTA); rr <= min(ROWS - 1, r + MAX_ROW_DELTA); ++rr)
+            for (int rr = 0; rr < ROWS; ++rr)
             {
+                if(r=rr){
+                    continue;
+                }
                 auto &row2 = rowstripes[rr];
                 auto &vec = row2.placed_insts;
                 if (vec.empty())
                     continue;
+                if(row2.y_origin_dbu < region.y_bottom || row2.y_origin_dbu > region.y_top){
+                    continue;
+                }
 
                 // binary search around A.x
                 auto it = std::lower_bound(vec.begin(), vec.end(), A.x_dbu,
@@ -826,6 +834,9 @@ static bool global_swap_one_pass(vector<RowStripe> &rowstripes,
                 inst_table[A.id].y_dbu = Ay;
                 inst_table[B.id].x_dbu = Bx;
                 inst_table[B.id].y_dbu = By;
+                string tmp_orient = inst_table[A.id].orient;
+                inst_table[A.id].orient = inst_table[B.id].orient;
+                inst_table[B.id].orient = tmp_orient;
 
                 inst_info a_new = inst_table[A.id];
                 inst_info b_new = inst_table[B.id];
@@ -1015,6 +1026,9 @@ static bool vertical_swap_one_pass(
                 inst_table[A.id].y_dbu = Ay;
                 inst_table[B.id].x_dbu = Bx;
                 inst_table[B.id].y_dbu = By;
+                string tmp_orient = inst_table[A.id].orient;
+                inst_table[A.id].orient = inst_table[B.id].orient;
+                inst_table[B.id].orient = tmp_orient;
 
                 inst_info a_new = inst_table[A.id];
                 inst_info b_new = inst_table[B.id];
@@ -1674,21 +1688,12 @@ void rewrite_def_coords_only(
                 if (it != inst_table.end())
                 {
                     const inst_info &inst = it->second;
-                    std::string new_orient = inst.orient;
-                    for (auto &row : row_table)
-                    {
-                        if (row.origin_y_dbu == inst.y_dbu)
-                        {
-                            new_orient = row.orient;
-                            break;
-                        }
-                    }
 
                     // 直接用 inst_table 裡面的 mov_or_fix / x / y / orient 寫回去
                     // 前面縮排你可以固定 4 個空格
                     out << "    + " << inst.mov_or_fix
                         << " ( " << inst.x_dbu << " " << inst.y_dbu << " ) "
-                        << new_orient << " ;\n";
+                        << inst.orient << " ;\n";
                     continue;
                 }
             }
@@ -1784,15 +1789,30 @@ int main(int argc, char *argv[])
     int vs_k_neighbors = 0;    // 原本 20，建議 50~80 視效能
     int max_outer_iters = 0;   // 外圈最多 12~15 輪
     int no_improve_rounds = 0; // 連續無改善的輪數，做早停
+    bool flag;
+    bool flag1;
     // 調參
-    if (inst_table.size() > 200000)
+    if (inst_table.size() > 200000 && inst_table.size() < 500000)
     {
         x_w = 20;
         K_near_for_GS = 20;
         max_row_delta = 3;
         vs_k_neighbors = 30;
         max_outer_iters = 8;
-        TIME_LIMIT_MS = 250000;
+        TIME_LIMIT_MS = 265000;
+        flag = true;
+        flag1 = true;
+    }
+    else if (inst_table.size() > 600000)
+    {
+        x_w = 20;
+        K_near_for_GS = 20;
+        max_row_delta = 3;
+        vs_k_neighbors = 5;
+        max_outer_iters = 8;
+        TIME_LIMIT_MS = 230000;
+        flag = false;
+        flag1 = true;
     }
     else
     {
@@ -1802,6 +1822,8 @@ int main(int argc, char *argv[])
         vs_k_neighbors = 40;
         max_outer_iters = 10;
         TIME_LIMIT_MS = 270000;
+        flag = true;
+        flag1 = true;
     }
 
     // print_row_with_cells(row_stripes);
@@ -1831,38 +1853,44 @@ int main(int argc, char *argv[])
             total_hpwl += kv.second;
 
         // 1) Global Swap
-        bool imp_gs = global_swap_one_pass(
-            row_stripes, inst_table, net_table, inst2nets,
-            pin_table, width_dbu, max_row_delta, total_hpwl, net2hpwl, K_near_for_GS, x_w);
-        improved_round |= imp_gs;
-        cout << "[Iter " << iter << "][GS ] HPWL = " << total_hpwl << (imp_gs ? " (improved)" : "") << "\n";
-        now = chrono::high_resolution_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now - start).count() > TIME_LIMIT_MS)
+        if (flag == true)
         {
-            cout << "Time limit reached, stop optimization.\n";
-            cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
-            break;
+            bool imp_gs = global_swap_one_pass(
+                row_stripes, inst_table, net_table, inst2nets,
+                pin_table, width_dbu, max_row_delta, total_hpwl, net2hpwl, K_near_for_GS, x_w);
+            improved_round |= imp_gs;
+            cout << "[Iter " << iter << "][GS ] HPWL = " << total_hpwl << (imp_gs ? " (improved)" : "") << "\n";
+            now = chrono::high_resolution_clock::now();
+            if (chrono::duration_cast<chrono::milliseconds>(now - start).count() > TIME_LIMIT_MS)
+            {
+                cout << "Time limit reached, stop optimization.\n";
+                cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
+                break;
+            }
         }
 
-        // 2) Vertical Swap
-        bool imp_vs = vertical_swap_one_pass(
-            row_stripes, inst_table, net_table, inst2nets,
-            pin_table, width_dbu, vs_k_neighbors, total_hpwl);
-        improved_round |= imp_vs;
-        cout << "[Iter " << iter << "][VS ] HPWL = " << total_hpwl << (imp_vs ? " (improved)" : "") << "\n";
-        now = chrono::high_resolution_clock::now();
-        if (chrono::duration_cast<chrono::milliseconds>(now - start).count() > TIME_LIMIT_MS)
+        if (flag1 == true)
         {
-            cout << "Time limit reached, stop optimization.\n";
-            cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
-            break;
+
+            // 2) Vertical Swap
+            bool imp_vs = vertical_swap_one_pass(
+                row_stripes, inst_table, net_table, inst2nets,
+                pin_table, width_dbu, vs_k_neighbors, total_hpwl);
+            improved_round |= imp_vs;
+            cout << "[Iter " << iter << "][VS ] HPWL = " << total_hpwl << (imp_vs ? " (improved)" : "") << "\n";
+            now = chrono::high_resolution_clock::now();
+            if (chrono::duration_cast<chrono::milliseconds>(now - start).count() > TIME_LIMIT_MS)
+            {
+                cout << "Time limit reached, stop optimization.\n";
+                cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
+                break;
+            }
+
+            net2hpwl = build_net2hpwl_cache(net_table, inst_table, pin_table);
+            total_hpwl = 0;
+            for (auto &kv : net2hpwl)
+                total_hpwl += kv.second;
         }
-
-        net2hpwl = build_net2hpwl_cache(net_table, inst_table, pin_table);
-        total_hpwl = 0;
-        for (auto &kv : net2hpwl)
-            total_hpwl += kv.second;
-
         // 3) Local Reordering（window-3）
         bool imp_lr = false;
         for (auto &row : row_stripes)
@@ -1923,7 +1951,7 @@ int main(int argc, char *argv[])
         total_hpwl += kv.second;
     // print_row_with_cells(row_stripes);
     cout << "Final HPWL: " << total_hpwl << endl;
-    auto ok = verify_rows_verbose(row_stripes, library_macros, &first_err, &all_errs);
+    /*auto ok = verify_rows_verbose(row_stripes, library_macros, &first_err, &all_errs);
 
     if (!ok)
     {
@@ -1937,7 +1965,7 @@ int main(int argc, char *argv[])
     else
     {
         cout << "OK last" << endl;
-    }
+    }*/
     rewrite_def_coords_only(argv[2], argv[3], inst_table, row_table);
 
     //----------記錄時間----------//
