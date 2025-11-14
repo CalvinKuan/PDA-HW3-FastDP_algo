@@ -19,6 +19,59 @@
 #include <cctype>
 
 using namespace std;
+using Clock = std::chrono::high_resolution_clock;
+using ns = std::chrono::nanoseconds;
+
+// ---- 全域 timing 累計（nanoseconds）----
+static long long g_t_opt_region_ns = 0;  // compute_optimal_region_for_inst
+static long long g_t_legal_same_ns = 0;  // check_legal_swap_same_row
+static long long g_t_legal_two_ns = 0;   // check_legal_swap_two_rows
+static long long g_t_delta_hpwl_ns = 0;  // delta_hpwl_cached
+static long long g_t_hpwl_recalc_ns = 0; // calculate_HPWL（兩個 for 迴圈）
+
+// ---- 呼叫次數（方便算平均）----
+static long long g_cnt_opt_region = 0;
+static long long g_cnt_legal_same = 0;
+static long long g_cnt_legal_two = 0;
+static long long g_cnt_delta_hpwl = 0;
+static long long g_cnt_hpwl_recalc = 0;
+
+// （可選）重設 timing 的小工具
+static void reset_global_swap_timers()
+{
+    g_t_opt_region_ns = 0;
+    g_t_legal_same_ns = 0;
+    g_t_legal_two_ns = 0;
+    g_t_delta_hpwl_ns = 0;
+    g_t_hpwl_recalc_ns = 0;
+
+    g_cnt_opt_region = 0;
+    g_cnt_legal_same = 0;
+    g_cnt_legal_two = 0;
+    g_cnt_delta_hpwl = 0;
+    g_cnt_hpwl_recalc = 0;
+}
+
+// （可選）印出統計結果
+static void print_global_swap_timers()
+{
+    auto to_ms = [](long long ns_val)
+    {
+        return ns_val / 1e6; // 轉毫秒
+    };
+
+    std::fprintf(stderr,
+                 "[GS timing] opt_region  : %.3f ms (%lld calls)\n"
+                 "[GS timing] legal_same  : %.3f ms (%lld calls)\n"
+                 "[GS timing] legal_two   : %.3f ms (%lld calls)\n"
+                 "[GS timing] delta_hpwl  : %.3f ms (%lld calls)\n"
+                 "[GS timing] hpwl_recalc : %.3f ms (%lld calls)\n",
+                 to_ms(g_t_opt_region_ns), g_cnt_opt_region,
+                 to_ms(g_t_legal_same_ns), g_cnt_legal_same,
+                 to_ms(g_t_legal_two_ns), g_cnt_legal_two,
+                 to_ms(g_t_delta_hpwl_ns), g_cnt_delta_hpwl,
+                 to_ms(g_t_hpwl_recalc_ns), g_cnt_hpwl_recalc);
+}
 
 int dbu;
 int site_width_dbu;
@@ -109,35 +162,63 @@ void print_row_with_cells(vector<RowStripe> &row_stripes)
 //---------------- helpers ----------------//
 vector<RowStripe> make_cell_map(vector<row_info> &row_table,
                                 unordered_map<string, inst_info> &inst_table,
-                                unordered_map<string, inst_info> & /*block_map*/)
+                                unordered_map<string, inst_info> &block_map)
 {
     vector<RowStripe> row_stripes;
-    row_stripes.reserve(row_table.size());
-    for (auto &row : row_table)
+    row_stripes.resize(row_table.size());
+
+    // 先把 row_table 的資訊塞進 row_stripes，並建 y 座標 -> row index 的 map
+    unordered_map<int, int> y2row;
+    y2row.reserve(row_table.size() * 2);
+
+    for (int i = 0; i < (int)row_table.size(); ++i)
     {
-        RowStripe current_stripe;
-        current_stripe.row_name = row.row_name;
-        current_stripe.x_origin_dbu = row.origin_x_dbu;
-        current_stripe.y_origin_dbu = row.origin_y_dbu;
-        current_stripe.x_sites = row.x_site_size;
-        current_stripe.x_spacing_dbu = row.x_spacing_dbu;
-        current_stripe.orient = row.orient;
-        current_stripe.placed_insts.clear();
-        for (auto &inst : inst_table)
-        {
-            if (inst.second.y_dbu == row.origin_y_dbu && inst.second.mov_or_fix == "PLACED")
-            {
-                current_stripe.placed_insts.push_back(inst.second);
-            }
-        }
-        std::sort(current_stripe.placed_insts.begin(), current_stripe.placed_insts.end(),
-                  [](const inst_info &a, const inst_info &b)
-                  {
-                      return a.x_dbu < b.x_dbu;
-                  });
-        row_stripes.push_back(std::move(current_stripe));
+        auto &row = row_table[i];
+        RowStripe rs;
+        rs.row_name = row.row_name;
+        rs.x_origin_dbu = row.origin_x_dbu;
+        rs.y_origin_dbu = row.origin_y_dbu;
+        rs.x_sites = row.x_site_size;
+        rs.x_spacing_dbu = row.x_spacing_dbu;
+        rs.orient = row.orient;
+        rs.row_blocks.clear();
+        rs.placed_insts.clear();
+
+        row_stripes[i] = std::move(rs);
+        y2row[row.origin_y_dbu] = i;
     }
+
+    for (auto &kv : inst_table)
+    {
+        const inst_info &inst = kv.second;
+        if (inst.mov_or_fix != "PLACED")
+            continue;
+
+        auto it = y2row.find(inst.y_dbu);
+        if (it == y2row.end())
+            continue; // 找不到對應 row 的就跳過（理論上不會發生）
+
+        int ridx = it->second;
+        row_stripes[ridx].placed_insts.push_back(inst);
+    }
+
+    // 每一 row 按 x 排序一次
+    for (auto &row : row_stripes)
+    {
+        std::sort(row.placed_insts.begin(), row.placed_insts.end(),
+                  [](const inst_info &a, const inst_info &b)
+                  { return a.x_dbu < b.x_dbu; });
+    }
+
     return row_stripes;
+}
+
+void makey2row_idx(vector<RowStripe> &rowstripes, unordered_map<int, int> &y2row_idx)
+{
+    for (int i = 0; i < rowstripes.size(); i++)
+    {
+        y2row_idx.insert({rowstripes[i].y_origin_dbu, i});
+    }
 }
 
 void calculate_block_bound(unordered_map<string, inst_info> &block_map,
@@ -165,9 +246,6 @@ void calculate_block_bound(unordered_map<string, inst_info> &block_map,
     }
 }
 
-// ---- HPWL cache helpers ----
-
-// delta HPWL using cache for "before" and only recomputing "after"
 static long long delta_hpwl_cached(
     const string &A, const string &B,
     unordered_map<string, inst_info> &inst_table,
@@ -175,21 +253,36 @@ static long long delta_hpwl_cached(
     unordered_map<string, vector<string>> &inst2nets,
     unordered_map<string, pin_map> &pin_table,
     unordered_map<string, long long> &net2hpwl,
-    int ax, int ay, int bx, int by)
+    int ax, int ay, int bx, int by,
+    std::vector<std::pair<std::string, long long>> *out_new = nullptr)
 {
     long long delta = 0;
-    unordered_set<string> affected;
+
+    // 用 static 小 vector 重用 buffer，避免每次 allocate/free
+    static std::vector<std::string> nets;
+    nets.clear();
+
     auto &na = inst2nets[A];
     auto &nb = inst2nets[B];
-    affected.insert(na.begin(), na.end());
-    affected.insert(nb.begin(), nb.end());
+    nets.reserve(na.size() + nb.size());
+    nets.insert(nets.end(), na.begin(), na.end());
+    nets.insert(nets.end(), nb.begin(), nb.end());
 
-    for (const auto &netname : affected)
+    // 去重：資料量通常很小，用 sort + unique 反而比 unordered_set 快
+    std::sort(nets.begin(), nets.end());
+    nets.erase(std::unique(nets.begin(), nets.end()), nets.end());
+
+    if (out_new)
+        out_new->clear();
+
+    for (const auto &netname : nets)
     {
         long long before = net2hpwl[netname];
 
         const auto &net = net_table[netname];
-        int x_max = INT_MIN, x_min = INT_MAX, y_max = INT_MIN, y_min = INT_MAX;
+        int x_max = INT_MIN, x_min = INT_MAX;
+        int y_max = INT_MIN, y_min = INT_MAX;
+
         for (const auto &name : net.connected_insts)
         {
             int xx, yy;
@@ -223,11 +316,18 @@ static long long delta_hpwl_cached(
             y_max = max(y_max, yy);
             y_min = min(y_min, yy);
         }
+
         long long after = (x_max - x_min) + (y_max - y_min);
         delta += (after - before);
+
+        if (out_new)
+            out_new->emplace_back(netname, after);
     }
+
     return delta;
 }
+
+
 // HPWL for one net list (instances or IO pins)
 long long calculate_HPWL(const vector<string> &net,
                          unordered_map<string, inst_info> &inst_table,
@@ -398,12 +498,10 @@ static rect cal_optimal_region(vector<int> &L, vector<int> &R, vector<int> &T, v
     optimal_region.y_top = max(iB, iT);
 
     // pad region to avoid over-narrow boxes
-    int padX = 80 * site_width_dbu;
-    int padY = 3 * site_width_dbu;
-    optimal_region.x_left -= padX;
-    optimal_region.x_right += padX;
-    optimal_region.y_bottom -= padY;
-    optimal_region.y_top += padY;
+    optimal_region.x_left;
+    optimal_region.x_right;
+    optimal_region.y_bottom;
+    optimal_region.y_top;
     return optimal_region;
 }
 
@@ -415,10 +513,6 @@ static rect compute_optimal_region_for_inst(const string &inst_name,
 {
     vector<int> L, R, T, B;
     auto itc = inst_table.find(inst_name);
-    if (itc == inst_table.end())
-    {
-        return {INT_MIN / 4, INT_MAX / 4, INT_MIN / 4, INT_MAX / 4};
-    }
     const inst_info &me = itc->second;
     auto itn = inst2nets.find(inst_name);
     if (itn != inst2nets.end())
@@ -427,13 +521,6 @@ static rect compute_optimal_region_for_inst(const string &inst_name,
         {
             bbox_excluding(me, net_table, pin_table, netname, inst_table, L, R, T, B);
         }
-    }
-    if (L.empty())
-    {
-        // fallback: wider x-range, allow vertical movement across a few rows
-        int span_x = 80 * site_width_dbu;
-        int span_y = 3 * site_width_dbu;
-        return {me.x_dbu - span_x, me.x_dbu + span_x, me.y_dbu - span_y, me.y_dbu + span_y};
     }
     return cal_optimal_region(L, R, T, B);
 }
@@ -577,6 +664,102 @@ static bool check_legal_swap_two_rows(
     return true;
 }
 
+// 檢查：在 row 的 idx 這個位置放一顆 new cell (newL,newR)
+// 會不會超出 row 邊界 / 撞到 block / 撞到左右鄰居
+static bool ok_row_single_swap_with_blocks(
+    const RowStripe &row,
+    int idx,                                                  // 要放新 cell 的 index（原本就有 cell 在這裡）
+    int newL, int newR, unordered_map<string, int> &width_dbu // 新 cell 的 [xL, xR)
+)
+{
+    // ---- 1) row 左右邊界 ----
+    int rowL = row.x_origin_dbu;
+    int rowR = row.x_origin_dbu + row.x_sites * row.x_spacing_dbu;
+    if (newL < rowL || newR > rowR)
+        return false;
+
+    // ---- 2) block 區段檢查 ----
+    // row_blocks 裡是 [blkL, blkR) 的 blocked 區域
+    for (const auto &blk : row.row_blocks)
+    {
+        int blkL = blk.first;
+        int blkR = blk.second;
+        // 只要新區間與 block 有交集就不行
+        if (!(newR <= blkL || blkR <= newL))
+            return false;
+    }
+
+    // ---- 3) 左右鄰居檢查（placed_insts 已經是 legal / 排序）----
+    const int N = (int)row.placed_insts.size();
+
+    // 左鄰居
+    if (idx - 1 >= 0)
+    {
+        const inst_info &L = row.placed_insts[idx - 1];
+        int Lw = width_dbu[L.type]; // 如果你沒有這個欄位，改用 width_dbu[L.type]
+        int Ll = L.x_dbu;
+        int Lr = Ll + Lw;
+
+        // new 區間左端必須在左鄰居右邊
+        if (!(newL >= Lr))
+            return false;
+    }
+
+    // 右鄰居
+    if (idx + 1 < N)
+    {
+        const inst_info &R = row.placed_insts[idx + 1];
+        int Rw = width_dbu[R.type]; // 同上，如果沒有就 width_dbu[R.type]
+        int Rl = R.x_dbu;
+        int Rr = Rl + Rw;
+
+        // new 區間右端必須在右鄰居左邊
+        if (!(newR <= Rl))
+            return false;
+    }
+
+    return true;
+}
+
+static bool check_legal_swap_two_rows_fast(
+    const RowStripe &rowA, int idxA,
+    const RowStripe &rowB, int idxB,
+    unordered_map<string, int> &width_dbu)
+{
+    const inst_info &A = rowA.placed_insts[idxA];
+    const inst_info &B = rowB.placed_insts[idxB];
+
+    // 取得寬度（如果 inst_info 本身有 width，就可以不用查 map）
+    int wA, wB;
+    auto itWA = width_dbu.find(A.type);
+    auto itWB = width_dbu.find(B.type);
+    if (itWA == width_dbu.end() || itWB == width_dbu.end())
+        return false;
+    wA = itWA->second;
+    wB = itWB->second;
+
+    // A 現在在 rowA 的 x = A.x_dbu，B 在 rowB 的 x = B.x_dbu
+    // swap 後：
+    //  - rowA 的 idxA 位置放 B，區間 [A.x, A.x + wB)
+    //  - rowB 的 idxB 位置放 A，區間 [B.x, B.x + wA)
+
+    int newBL = A.x_dbu;
+    int newBR = newBL + wB;
+
+    int newAL = B.x_dbu;
+    int newAR = newAL + wA;
+
+    // rowA 上放 B 會不會超界 / 撞 block / 撞左右鄰居
+    if (!ok_row_single_swap_with_blocks(rowA, idxA, newBL, newBR, width_dbu))
+        return false;
+
+    // rowB 上放 A 會不會超界 / 撞 block / 撞左右鄰居
+    if (!ok_row_single_swap_with_blocks(rowB, idxB, newAL, newAR, width_dbu))
+        return false;
+
+    return true;
+}
+
 // delta HPWL if A placed at (ax,ay) and B placed at (bx,by)
 static long long delta_hpwl(const string &inst_a_name, const string &inst_b_name,
                             unordered_map<string, inst_info> &inst_table,
@@ -645,170 +828,157 @@ static long long delta_hpwl(const string &inst_a_name, const string &inst_b_name
     return delta;
 }
 
-static bool cell_sliding(
-    RowStripe &row,
-    unordered_map<string, int> &width_dbu,
-    unordered_map<string, inst_info> &inst_table,
-    unordered_map<string, net_map> &net_table,
-    unordered_map<string, vector<string>> &inst2nets,
-    unordered_map<string, pin_map> &pin_table,
-    long long &total_hpwl)
-{
-    bool improved = false;
-    if (row.placed_insts.empty())
-        return false;
-
-    const int row_xL = row.x_origin_dbu;
-    const int row_xR = row.x_origin_dbu + row.x_sites * row.x_spacing_dbu;
-
-    for (int i = 0; i < (int)row.placed_insts.size(); ++i)
-    {
-        inst_info &A = row.placed_insts[i];
-        int wA = width_dbu[A.type];
-
-        int best_x = A.x_dbu;
-        long long best_delta = 0;
-
-        // 找到可以滑動到的最左合法位置
-        int target_x = row_xL;
-        for (int j = i - 1; j >= 0; --j)
-        {
-            target_x = row.placed_insts[j].x_dbu + width_dbu[row.placed_insts[j].type];
-            break;
-        }
-
-        // Site Align
-        if (!is_site_aligned(target_x, row_xL, row.x_spacing_dbu))
-        {
-            int offset = (target_x - row_xL) % row.x_spacing_dbu;
-            target_x -= offset;
-        }
-
-        // 還在 row 範圍內？
-        if (target_x < row_xL)
-            target_x = row_xL;
-
-        if (target_x != A.x_dbu)
-        {
-            // 檢 legality
-            if (inside_row_usable_range(target_x, target_x + wA, row_xL, row_xR) &&
-                no_overlap_with_row(row, width_dbu, target_x, target_x + wA, i, -1) &&
-                no_overlap_with_blocks(target_x, target_x + wA, row.row_blocks))
-            {
-                long long d = delta_hpwl(
-                    A.id, A.id, inst_table, net_table, inst2nets, pin_table,
-                    target_x, A.y_dbu, A.x_dbu, A.y_dbu);
-
-                if (d < best_delta)
-                {
-                    best_delta = d;
-                    best_x = target_x;
-                }
-            }
-        }
-
-        if (best_delta < 0)
-        {
-            // Apply sliding
-            inst_table[A.id].x_dbu = best_x;
-            A.x_dbu = best_x;
-            total_hpwl += best_delta;
-            improved = true;
-
-            // keep ordering
-            std::sort(row.placed_insts.begin(), row.placed_insts.end(),
-                      [](auto &a, auto &b)
-                      { return a.x_dbu < b.x_dbu; });
-        }
-    }
-
-    return improved;
-}
-
 //---------------- Global Swap core ----------------//
 static bool global_swap_one_pass(vector<RowStripe> &rowstripes,
                                  unordered_map<string, inst_info> &inst_table,
                                  unordered_map<string, net_map> &net_table,
                                  unordered_map<string, vector<string>> &inst2nets,
                                  unordered_map<string, pin_map> &pin_table,
-                                 const unordered_map<string, int> &width_dbu,
+                                 unordered_map<string, int> &width_dbu,
                                  int max_row_delta,
                                  long long &total_hpwl,
-                                 unordered_map<string, long long> &net2hpwl, int K, int x_w)
+                                 unordered_map<string, long long> &net2hpwl,
+                                 int K,
+                                 int x_w,
+                                 unordered_map<int, int> &y2row_idx)
 {
-
     bool any_improved = false;
     const int ROWS = (int)rowstripes.size();
 
     // localized search params
-    const int MAX_ROW_DELTA = max_row_delta; // r ± 2
-    const int K_NEAR = K;                    // per row
-    int X_WIN;                               // A.x ± 40 sites
+    const int MAX_ROW_DELTA = max_row_delta; // 限制 r 上下的 row 數
+    const int K_NEAR = K;                    // neighbor 數
+    int X_WIN;                               // A.x ± window
+
+    // 依設計大小動態決定 stride（跳著選 A）
+    int total_insts = (int)inst_table.size();
+    int stride = 1;
+    if (total_insts > 800000)
+        stride = 4;
+    else if (total_insts > 400000)
+        stride = 3;
+    else if (total_insts > 200000)
+        stride = 2;
 
     for (int r = 0; r < ROWS; ++r)
     {
         auto &row = rowstripes[r];
         X_WIN = x_w * row.x_spacing_dbu;
         const int N = (int)row.placed_insts.size();
-        for (int ia = 0; ia < N; ++ia)
+        if (N == 0)
+            continue;
+
+        // 這裡用 (r % stride) 讓不同 row 的起點錯開一點
+        for (int ia = (r % stride); ia < N; ia += stride)
         {
             inst_info &A = row.placed_insts[ia];
 
-            rect region = compute_optimal_region_for_inst(A.id, net_table, pin_table, inst_table, inst2nets);
+            // --- 計時 compute_optimal_region_for_inst ---
+            auto t_opt0 = Clock::now();
+            rect region = compute_optimal_region_for_inst(
+                A.id, net_table, pin_table, inst_table, inst2nets);
+            auto t_opt1 = Clock::now();
+            g_t_opt_region_ns += std::chrono::duration_cast<ns>(t_opt1 - t_opt0).count();
+            ++g_cnt_opt_region;
+            // -------------------------------------------
 
             long long best_delta = 0;
             int best_r = -1, best_ib = -1;
 
-            for (int rr = 0; rr < ROWS; ++rr)
+            // 由 optimal region 查出大概的 row 範圍
+            auto it_low = y2row_idx.find(region.y_bottom);
+            auto it_high = y2row_idx.find(region.y_top);
+            if (it_low == y2row_idx.end() || it_high == y2row_idx.end())
+                continue;
+
+            int rr_low = it_low->second;
+            int rr_high = it_high->second;
+
+            // 再用 MAX_ROW_DELTA 進一步收窄：只看 r ± MAX_ROW_DELTA
+            int rr_start = std::max(rr_low, std::max(0, r - MAX_ROW_DELTA));
+            int rr_end = std::min(rr_high, std::min(ROWS - 1, r + MAX_ROW_DELTA));
+
+            for (int rr = rr_start; rr <= rr_end; ++rr)
             {
-                if(r=rr){
-                    continue;
-                }
                 auto &row2 = rowstripes[rr];
                 auto &vec = row2.placed_insts;
                 if (vec.empty())
                     continue;
-                if(row2.y_origin_dbu < region.y_bottom || row2.y_origin_dbu > region.y_top){
+
+                // region window（保險起見再檢查一次 y）
+                if (row2.y_origin_dbu < region.y_bottom ||
+                    row2.y_origin_dbu > region.y_top)
                     continue;
-                }
 
                 // binary search around A.x
-                auto it = std::lower_bound(vec.begin(), vec.end(), A.x_dbu,
-                                           [](const inst_info &z, int x)
-                                           { return z.x_dbu < x; });
+                auto it = std::lower_bound(
+                    vec.begin(), vec.end(), A.x_dbu,
+                    [](const inst_info &z, int x)
+                    { return z.x_dbu < x; });
                 int center = (int)std::distance(vec.begin(), it);
-                int left = max(0, center - K_NEAR), right = min((int)vec.size() - 1, center + K_NEAR);
+                int left = std::max(0, center - K_NEAR);
+                int right = std::min((int)vec.size() - 1, center + K_NEAR);
 
                 for (int ib = left; ib <= right; ++ib)
                 {
                     const inst_info &B = vec[ib];
                     if (B.id == A.id)
                         continue;
-                    if (abs(B.x_dbu - A.x_dbu) > X_WIN)
+                    if (std::abs(B.x_dbu - A.x_dbu) > X_WIN)
                         continue;
 
-                    // region window
+                    // region window (x / y)
                     if (B.x_dbu < region.x_left || B.x_dbu > region.x_right)
                         continue;
                     if (B.y_dbu < region.y_bottom || B.y_dbu > region.y_top)
                         continue;
 
-                    bool legal = (r == rr)
-                                     ? check_legal_swap_same_row(row, ia, ib, width_dbu, row.x_origin_dbu,
-                                                                 row.x_origin_dbu + row.x_sites * row.x_spacing_dbu, row.x_spacing_dbu)
-                                     : check_legal_swap_two_rows(row, ia, row.x_origin_dbu,
-                                                                 row.x_origin_dbu + row.x_sites * row.x_spacing_dbu,
-                                                                 row2, ib, row2.x_origin_dbu,
-                                                                 row2.x_origin_dbu + row2.x_sites * row.x_spacing_dbu,
-                                                                 width_dbu, row.x_spacing_dbu);
+                    bool legal = false;
+
+                    auto t_legal0 = Clock::now();
+                    if (r == rr)
+                    {
+                        // 你原本的 same-row 檢查（如果它已有處理 block 就照用）
+                        legal = check_legal_swap_same_row(
+                            row, ia, ib, width_dbu,
+                            row.x_origin_dbu,
+                            row.x_origin_dbu + row.x_sites * row.x_spacing_dbu,
+                            row.x_spacing_dbu);
+                        auto t_legal1 = Clock::now();
+                        g_t_legal_same_ns += std::chrono::duration_cast<ns>(t_legal1 - t_legal0).count();
+                        ++g_cnt_legal_same;
+                    }
+                    else
+                    {
+                        // 新的 two-row fast 版本（有看 row_blocks）
+                        legal = check_legal_swap_two_rows_fast(
+                            row, ia, row2, ib, width_dbu);
+                        auto t_legal1 = Clock::now();
+                        g_t_legal_two_ns += std::chrono::duration_cast<ns>(t_legal1 - t_legal0).count();
+                        ++g_cnt_legal_two;
+                    }
+
+                    // -------------------------
+
                     if (!legal)
                         continue;
 
-                    int ax = B.x_dbu, ay = (r == rr) ? A.y_dbu : row2.y_origin_dbu;
-                    int bx = A.x_dbu, by = (r == rr) ? B.y_dbu : row.y_origin_dbu;
+                    int ax = B.x_dbu;
+                    int ay = (r == rr) ? A.y_dbu : row2.y_origin_dbu;
+                    int bx = A.x_dbu;
+                    int by = (r == rr) ? B.y_dbu : row.y_origin_dbu;
 
-                    long long d = delta_hpwl_cached(A.id, B.id, inst_table, net_table, inst2nets, pin_table,
-                                                    net2hpwl, ax, ay, bx, by);
+                    // --- 計時 delta_hpwl_cached ---
+                    auto t_delta0 = Clock::now();
+                    long long d = delta_hpwl_cached(
+                        A.id, B.id,
+                        inst_table, net_table, inst2nets, pin_table,
+                        net2hpwl, ax, ay, bx, by);
+                    auto t_delta1 = Clock::now();
+                    g_t_delta_hpwl_ns += std::chrono::duration_cast<ns>(t_delta1 - t_delta0).count();
+                    ++g_cnt_delta_hpwl;
+                    // --------------------------------
+
                     if (d < best_delta)
                     {
                         best_delta = d;
@@ -820,7 +990,6 @@ static bool global_swap_one_pass(vector<RowStripe> &rowstripes,
 
             if (best_delta < 0 && best_r >= 0)
             {
-
                 any_improved = true;
 
                 auto &rowB = rowstripes[best_r];
@@ -828,83 +997,68 @@ static bool global_swap_one_pass(vector<RowStripe> &rowstripes,
 
                 int Ax = B.x_dbu, Ay = B.y_dbu;
                 int Bx = A.x_dbu, By = A.y_dbu;
-                // cout << "processing " << row.row_name << "and" << rowB.row_name << " Swap " << A.id << " and " << B.id << "detla:" << best_delta << endl;
 
+                // 更新 inst_table 的位置 + orient
                 inst_table[A.id].x_dbu = Ax;
                 inst_table[A.id].y_dbu = Ay;
                 inst_table[B.id].x_dbu = Bx;
                 inst_table[B.id].y_dbu = By;
-                string tmp_orient = inst_table[A.id].orient;
+                std::string tmp_orient = inst_table[A.id].orient;
                 inst_table[A.id].orient = inst_table[B.id].orient;
                 inst_table[B.id].orient = tmp_orient;
 
                 inst_info a_new = inst_table[A.id];
                 inst_info b_new = inst_table[B.id];
 
-                // also mutate in row vectors
-                // cout<<row.placed_insts[ia].id<<" "<<row.placed_insts[ia].y_dbu<<endl;
+                // row vectors 也要同步
                 row.placed_insts[ia] = b_new;
-                // cout<<row.placed_insts[ia].id<<" "<<row.placed_insts[ia].y_dbu<<endl;
-                // cout<<rowB.placed_insts[best_ib].id<<" "<<rowB.placed_insts[best_ib].y_dbu<<endl;
                 if (best_r == r)
-                {
                     row.placed_insts[best_ib] = a_new;
-                }
                 else
-                {
                     rowB.placed_insts[best_ib] = a_new;
-                }
 
-                // keep rows sorted
-                std::sort(row.placed_insts.begin(), row.placed_insts.end(),
-                          [](const inst_info &p, const inst_info &q)
-                          { return p.x_dbu < q.x_dbu; });
-                if (best_r != r)
-                {
-                    std::sort(rowB.placed_insts.begin(), rowB.placed_insts.end(),
-                              [](const inst_info &p, const inst_info &q)
-                              { return p.x_dbu < q.x_dbu; });
-                }
-
-                // update total_hpwl and cache
-                // add best_delta for incremental total
+                // 更新 total_hpwl
                 total_hpwl += best_delta;
 
-                unordered_set<string> affected;
-                affected.insert(inst2nets[A.id].begin(), inst2nets[A.id].end());
-                affected.insert(inst2nets[B.id].begin(), inst2nets[B.id].end());
-                for (const auto &netname : affected)
+                // --- 計時 HPWL 重新計算（兩個 for 迴圈一起算） ---
+                auto t_hpwl0 = Clock::now();
+
+                for (const auto &netname : inst2nets[A.id])
                 {
-                    // cout << netname << " hpwl: " << net2hpwl[netname] << endl;
-                    long long newv = calculate_HPWL(net_table[netname].connected_insts, inst_table, pin_table);
+                    long long newv = calculate_HPWL(
+                        net_table[netname].connected_insts,
+                        inst_table, pin_table);
                     net2hpwl[netname] = newv;
-                    // cout << netname << " hpwl: " << net2hpwl[netname] << endl;
                 }
-                // cout << "total_hpwl " << total_hpwl << endl;
-                /*total_hpwl = 0;
-                for (auto &kv : net2hpwl)
-                    total_hpwl += kv.second;*/
-                // cout << "total_hpwl " << total_hpwl << endl;
+                for (const auto &netname : inst2nets[B.id])
+                {
+                    long long newv = calculate_HPWL(
+                        net_table[netname].connected_insts,
+                        inst_table, pin_table);
+                    net2hpwl[netname] = newv;
+                }
+
+                auto t_hpwl1 = Clock::now();
+                g_t_hpwl_recalc_ns += std::chrono::duration_cast<ns>(t_hpwl1 - t_hpwl0).count();
+                ++g_cnt_hpwl_recalc;
+                // ------------------------------------------------
             }
         }
     }
-    /*total_hpwl = 0;
-    for (auto &kv : net2hpwl)
-        total_hpwl += kv.second;
-    cout << "total_hpwl " << total_hpwl << endl;*/
+
     return any_improved;
 }
 
-// 需要: #include <tuple>
 static bool vertical_swap_one_pass(
     vector<RowStripe> &rowstripes,
     unordered_map<string, inst_info> &inst_table,
     unordered_map<string, net_map> &net_table,
     unordered_map<string, vector<string>> &inst2nets,
     unordered_map<string, pin_map> &pin_table,
-    const unordered_map<string, int> &width_dbu,
+    unordered_map<string, int> &width_dbu,
     int k_neighbors,
-    long long &total_hpwl)
+    long long &total_hpwl,
+    unordered_map<string, long long> &net2hpwl) // ★多這個
 {
     bool any_improved = false;
     const int ROWS = (int)rowstripes.size();
@@ -915,27 +1069,44 @@ static bool vertical_swap_one_pass(
     {
         auto &row = rowstripes[r];
         const int N = (int)row.placed_insts.size();
+        if (N == 0)
+            continue;
+
         for (int ia = 0; ia < N; ++ia)
         {
             inst_info &A = row.placed_insts[ia];
+            if (A.mov_or_fix != "PLACED")
+                continue; // ★避免動 fixed cell
 
             // 只在 A 的最佳區域「不在本列」時才嘗試
-            rect region = compute_optimal_region_for_inst(A.id, net_table, pin_table, inst_table, inst2nets);
-            if (!(region.y_top > row.y_origin_dbu || region.y_bottom < row.y_origin_dbu))
-                continue;
+            rect region = compute_optimal_region_for_inst(
+                A.id, net_table, pin_table, inst_table, inst2nets);
 
-            // 依目標方向決定掃描順序：優先往上或往下，再試±2列
+            // row 高度的中線
+            int row_mid_y = row.y_origin_dbu; // 如果你有 row_height，就 + row_height/2
+            int reg_mid_y = (region.y_bottom + region.y_top) / 2;
+
+            // 若 row 中線落在 optimal region 裡，就不用 vertical swap
+            if (reg_mid_y >= row.y_origin_dbu &&
+                reg_mid_y <= row.y_origin_dbu)
+            {
+                // （如果有 row 高度要改成 [y_origin, y_origin+height]）
+                continue;
+            }
+
+            // 依目標方向決定掃描順序：優先往 optimal region 的方向
             vector<int> dr_order;
-            if (region.y_top > row.y_origin_dbu)
+            if (reg_mid_y > row_mid_y)
                 dr_order = {+1, -1, +2, -2};
             else
                 dr_order = {-1, +1, -2, +2};
 
             // 先收候選：用 A.x±W 的寬鬆窗，並以 "y向收益" 粗估排序
-            const int W = 40 * row.x_spacing_dbu; // 可視情況調大到 60
+            const int W = 40 * row.x_spacing_dbu; // 可照需要調
             const int y_med = (region.y_bottom + region.y_top) / 2;
 
             vector<tuple<int, int, int>> pool; // (approx_gain, target_row, ib)
+
             for (int dr : dr_order)
             {
                 int tr = r + dr;
@@ -945,37 +1116,41 @@ static bool vertical_swap_one_pass(
 
                 for (int ib = 0; ib < (int)rowT.placed_insts.size(); ++ib)
                 {
-                    if (rowT.placed_insts[ib].id == A.id)
-                    {
-                        continue;
-                    }
                     const auto &B = rowT.placed_insts[ib];
+                    if (B.id == A.id)
+                        continue;
+                    if (B.mov_or_fix != "PLACED")
+                        continue; // ★不要動 fixed
 
                     // 放寬 x 視窗：只要求 B.x 靠近 A.x
                     if (B.x_dbu < A.x_dbu - W || B.x_dbu > A.x_dbu + W)
                         continue;
 
                     // 粗估 y 向收益（越大越好）：把 A 從 row.y 移到 rowT.y
-                    int approx_gain = abs(A.y_dbu - y_med) - abs(rowT.y_origin_dbu - y_med);
+                    int approx_gain = std::abs(A.y_dbu - y_med) - std::abs(rowT.y_origin_dbu - y_med);
+
                     pool.emplace_back(approx_gain, tr, ib);
                 }
             }
+
             if (pool.empty())
                 continue;
 
             // 取前 k_neighbors 個最高的 approx_gain
             if ((int)pool.size() > k_neighbors)
             {
-                std::nth_element(pool.begin(), pool.begin() + k_neighbors, pool.end(),
+                std::nth_element(pool.begin(),
+                                 pool.begin() + k_neighbors,
+                                 pool.end(),
                                  [](const auto &p, const auto &q)
-                                 { return get<0>(p) > get<0>(q); });
+                                 { return std::get<0>(p) > std::get<0>(q); });
                 pool.resize(k_neighbors);
             }
             else
             {
                 std::sort(pool.begin(), pool.end(),
                           [](const auto &p, const auto &q)
-                          { return get<0>(p) > get<0>(q); });
+                          { return std::get<0>(p) > std::get<0>(q); });
             }
 
             long long best_delta = 0;
@@ -984,24 +1159,29 @@ static bool vertical_swap_one_pass(
             // 逐一檢 legality + 真正 ΔHPWL
             for (auto &cand : pool)
             {
-                int tr = get<1>(cand), ib = get<2>(cand);
+                int tr = std::get<1>(cand);
+                int ib = std::get<2>(cand);
                 auto &rowT = rowstripes[tr];
 
-                bool legal = check_legal_swap_two_rows(
-                    row, ia, row.x_origin_dbu,
-                    row.x_origin_dbu + row.x_sites * row.x_spacing_dbu,
-                    rowT, ib, rowT.x_origin_dbu,
-                    rowT.x_origin_dbu + rowT.x_sites * row.x_spacing_dbu,
-                    width_dbu, row.x_spacing_dbu);
+                // ★用 fast 版 legality，會檢 row_blocks
+                bool legal = check_legal_swap_two_rows_fast(
+                    row, ia, rowT, ib, width_dbu);
                 if (!legal)
                     continue;
 
                 const auto &B = rowT.placed_insts[ib];
-                int ax = B.x_dbu, ay = rowT.y_origin_dbu;
-                int bx = A.x_dbu, by = row.y_origin_dbu;
 
-                long long d = delta_hpwl(A.id, B.id, inst_table, net_table, inst2nets, pin_table,
-                                         ax, ay, bx, by);
+                int ax = B.x_dbu;
+                int ay = rowT.y_origin_dbu;
+                int bx = A.x_dbu;
+                int by = row.y_origin_dbu;
+
+                // ★改成 delta_hpwl_cached，用 net2hpwl
+                long long d = delta_hpwl_cached(
+                    A.id, B.id,
+                    inst_table, net_table, inst2nets, pin_table,
+                    net2hpwl, ax, ay, bx, by);
+
                 if (d < best_delta)
                 {
                     best_delta = d;
@@ -1010,46 +1190,53 @@ static bool vertical_swap_one_pass(
                 }
             }
 
-            if (best_ib >= 0)
+            if (best_ib >= 0 && best_delta < 0)
             {
                 any_improved = true;
                 total_hpwl += best_delta;
 
                 auto &rowT = rowstripes[best_tr];
                 auto &B = rowT.placed_insts[best_ib];
-                // cout << "processing " << row.row_name << "and" << rowT.row_name << " Swap " << A.id << " and " << B.id << "detla:" << best_delta << endl;
 
                 // 更新 inst_table
                 int Ax = B.x_dbu, Ay = B.y_dbu;
                 int Bx = A.x_dbu, By = A.y_dbu;
+
                 inst_table[A.id].x_dbu = Ax;
                 inst_table[A.id].y_dbu = Ay;
                 inst_table[B.id].x_dbu = Bx;
                 inst_table[B.id].y_dbu = By;
+
                 string tmp_orient = inst_table[A.id].orient;
                 inst_table[A.id].orient = inst_table[B.id].orient;
                 inst_table[B.id].orient = tmp_orient;
 
                 inst_info a_new = inst_table[A.id];
                 inst_info b_new = inst_table[B.id];
-                // cout<<row.placed_insts[ia].id<<" "<<row.placed_insts[ia].y_dbu<<endl;
+
                 row.placed_insts[ia] = b_new;
-                // cout<<row.placed_insts[ia].id<<" "<<row.placed_insts[ia].y_dbu<<endl;
-                // cout<<rowT.placed_insts[best_ib].id<<" "<<rowT.placed_insts[best_ib].y_dbu<<endl;
                 rowT.placed_insts[best_ib] = a_new;
-                // cout<<rowT.placed_insts[best_ib].id<<" "<<rowT.placed_insts[best_ib].y_dbu<<endl;
 
-                // 同步 row vectors
-                // std::swap(A.x_dbu, B.x_dbu);
-                // std::swap(A.y_dbu, B.y_dbu);
+                // ★跟 GS 一樣，重算 A/B nets 的 HPWL 更新 net2hpwl（時間很小）
+                for (const auto &netname : inst2nets[A.id])
+                {
+                    long long newv = calculate_HPWL(
+                        net_table[netname].connected_insts,
+                        inst_table, pin_table);
+                    net2hpwl[netname] = newv;
+                }
+                for (const auto &netname : inst2nets[B.id])
+                {
+                    long long newv = calculate_HPWL(
+                        net_table[netname].connected_insts,
+                        inst_table, pin_table);
+                    net2hpwl[netname] = newv;
+                }
 
-                // 各列按 x 重新排序
-                std::sort(row.placed_insts.begin(), row.placed_insts.end(),
-                          [](const inst_info &p, const inst_info &q)
-                          { return p.x_dbu < q.x_dbu; });
-                std::sort(rowT.placed_insts.begin(), rowT.placed_insts.end(),
-                          [](const inst_info &p, const inst_info &q)
-                          { return p.x_dbu < q.x_dbu; });
+                // ★保持你原本註解：row 之後再整體 sort-by-x，一次做
+                // （建議在整個 vertical_swap phase 結束後，對所有 row 做一次
+                //   sort(row.placed_insts.begin(), row.placed_insts.end(),
+                //        [](const inst_info&a,const inst_info&b){return a.x_dbu<b.x_dbu;});）
             }
         }
     }
@@ -1620,91 +1807,120 @@ static std::string ltrim(const std::string &s)
     return s.substr(i);
 }
 
-// 只覆寫 COMPONENTS 裡面 + PLACED 那行的座標
+#include <filesystem>
+#include <cerrno>
+#include <cstring>
+
+namespace fs = std::filesystem;
+
 void rewrite_def_coords_only(
-    const std::string &in_def,
-    const std::string &out_def,
-    const std::unordered_map<std::string, inst_info> &inst_table, vector<row_info> &row_table)
+    std::string &in_def,
+    std::string &out_def,
+    std::unordered_map<std::string, inst_info> &inst_table,
+    std::vector<row_info> &row_table)
 {
+    // 1) 確保 output 資料夾存在
+    try
+    {
+        fs::path out_path(out_def);
+        fs::path parent = out_path.parent_path();
+        if (!parent.empty() && !fs::exists(parent))
+        {
+            fs::create_directories(parent);
+            std::cout << "[INFO] Created output dir: " << parent << "\n";
+        }
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[ERROR] create_directories failed for \"" << out_def
+                  << "\": " << e.what() << "\n";
+        // 先不要 return，萬一目錄本來就存在
+    }
+
+    // 2) 開 input DEF
     std::ifstream in(in_def);
     if (!in.is_open())
     {
-        std::cerr << "[ERROR] Cannot open input DEF: " << in_def << "\n";
+        std::cerr << "[ERROR] Cannot open input DEF: " << in_def
+                  << " (errno=" << errno << " " << std::strerror(errno) << ")\n";
         return;
     }
 
-    std::ofstream out(out_def);
+    // 3) 開 output DEF（不存在就會新建，存在就覆寫）
+    std::ofstream out(out_def); // 預設是 trunc 模式
     if (!out.is_open())
     {
-        std::cerr << "[ERROR] Cannot open output DEF: " << out_def << "\n";
+        std::cerr << "[ERROR] Cannot open output DEF: " << out_def
+                  << " (errno=" << errno << " " << std::strerror(errno) << ")\n";
         return;
     }
 
     std::string line;
     bool in_components = false;
     std::string current_inst_name;
+    long long updated_cnt = 0;
 
     while (std::getline(in, line))
     {
         std::string trimmed = ltrim(line);
 
-        // 進入 / 離開 COMPONENTS 區
+        // 進入 / 離開 COMPONENTS
         if (trimmed.rfind("COMPONENTS", 0) == 0)
         {
             in_components = true;
             current_inst_name.clear();
-            out << line << "\n"; // header 原樣輸出
+            out << line << "\n";
             continue;
         }
         if (trimmed.rfind("END COMPONENTS", 0) == 0)
         {
             in_components = false;
             current_inst_name.clear();
-            out << line << "\n"; // END 原樣輸出
+            out << line << "\n";
             continue;
         }
 
         if (in_components)
         {
-            // 例： "  - inst1234 NAND2X1"
+            // 例: "  - U1234 NAND2_X1"
             if (trimmed.rfind("- ", 0) == 0)
             {
-                // parse instance name (= 第二個 token)
                 std::istringstream iss(trimmed);
                 std::string dash, inst_name;
                 iss >> dash >> inst_name;
                 current_inst_name = inst_name;
 
-                out << line << "\n"; // 這一行全部照抄
+                out << line << "\n"; // header 行照抄
                 continue;
             }
 
-            // 例： "    + PLACED ( 1000 2000 ) N ;"
-            if (!current_inst_name.empty() &&
-                trimmed.rfind("+", 0) == 0)
+            // 例: "    + PLACED ( 100 200 ) N ;"
+            if (!current_inst_name.empty() && trimmed.rfind("+", 0) == 0)
             {
-
                 auto it = inst_table.find(current_inst_name);
                 if (it != inst_table.end())
                 {
                     const inst_info &inst = it->second;
 
-                    // 直接用 inst_table 裡面的 mov_or_fix / x / y / orient 寫回去
-                    // 前面縮排你可以固定 4 個空格
                     out << "    + " << inst.mov_or_fix
                         << " ( " << inst.x_dbu << " " << inst.y_dbu << " ) "
                         << inst.orient << " ;\n";
-                    continue;
+
+                    ++updated_cnt;
+                    continue; // 不寫原本那行
                 }
             }
         }
 
-        // 其他情況全部照抄
+        // 其他行全部照抄
         out << line << "\n";
     }
 
     in.close();
     out.close();
+
+    std::cout << "[INFO] rewrite_def_coords_only: updated "
+              << updated_cnt << " components for " << out_def << "\n";
 }
 
 //---------------------------------main-----------------------//
@@ -1739,6 +1955,7 @@ int main(int argc, char *argv[])
 
     unordered_map<string, macro_info> library_macros;
     vector<row_info> row_table;
+    unordered_map<int, int> y2row_idx;
     unordered_map<string, inst_info> inst_table;
     unordered_map<string, pin_map> pin_table;
     unordered_map<string, net_map> net_table;
@@ -1746,15 +1963,19 @@ int main(int argc, char *argv[])
 
     parseLEF(lef, library_macros);
     parseDEF(def, row_table, inst_table, pin_table, net_table, block_map);
+    auto now = chrono::high_resolution_clock::now();
+    cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
 
     vector<RowStripe> row_stripes = make_cell_map(row_table, inst_table, block_map);
     calculate_block_bound(block_map, library_macros, row_stripes);
 
     unordered_map<string, vector<string>> inst2nets = build_inst2nets(net_table);
     unordered_map<string, int> width_dbu = build_macro_width_dbu(library_macros);
+    makey2row_idx(row_stripes, y2row_idx);
+    now = chrono::high_resolution_clock::now();
 
     // Diagnostics: missing width types
-    size_t miss = 0;
+    /*size_t miss = 0;
     for (auto &kv : inst_table)
     {
         if (!width_dbu.count(kv.second.type))
@@ -1792,54 +2013,45 @@ int main(int argc, char *argv[])
     bool flag;
     bool flag1;
     // 調參
-    if (inst_table.size() > 200000 && inst_table.size() < 500000)
+    if (inst_table.size() > 200000 && inst_table.size() < 600000)
     {
         x_w = 20;
-        K_near_for_GS = 20;
-        max_row_delta = 3;
-        vs_k_neighbors = 30;
-        max_outer_iters = 8;
-        TIME_LIMIT_MS = 265000;
+        K_near_for_GS = 8;
+        max_row_delta = 2;
+        vs_k_neighbors = 10;
+        max_outer_iters = 1;
+        TIME_LIMIT_MS = 200000;
         flag = true;
         flag1 = true;
     }
-    else if (inst_table.size() > 600000)
+    else if (inst_table.size() >= 600000)
     {
         x_w = 20;
-        K_near_for_GS = 20;
+        K_near_for_GS = 3;
         max_row_delta = 3;
         vs_k_neighbors = 5;
-        max_outer_iters = 8;
+        max_outer_iters = 1;
         TIME_LIMIT_MS = 230000;
-        flag = false;
+        flag = true;
         flag1 = true;
     }
     else
     {
         x_w = 80;
         K_near_for_GS = 60;
-        max_row_delta = 20;
+        max_row_delta = 10;
         vs_k_neighbors = 40;
-        max_outer_iters = 10;
+        max_outer_iters = 8;
         TIME_LIMIT_MS = 270000;
         flag = true;
         flag1 = true;
     }
 
     // print_row_with_cells(row_stripes);
+    reset_global_swap_timers();
     for (int iter = 0; iter < max_outer_iters; ++iter)
     {
         bool improved_round = false;
-
-        bool imp_cs = false;
-        for (auto &row : row_stripes)
-        {
-            bool row_improved = cell_sliding(row, width_dbu, inst_table, net_table, inst2nets, pin_table, total_hpwl);
-            imp_cs |= row_improved;
-        }
-        improved_round |= imp_cs;
-        cout << "[Iter " << iter << "][CS ] HPWL = " << total_hpwl << (imp_cs ? " (improved)" : "") << "\n";
-        // cout<<"table 1"<<endl;
         auto now = chrono::high_resolution_clock::now();
         if (chrono::duration_cast<chrono::milliseconds>(now - start).count() > TIME_LIMIT_MS)
         {
@@ -1847,17 +2059,12 @@ int main(int argc, char *argv[])
             cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
             break;
         }
-        net2hpwl = build_net2hpwl_cache(net_table, inst_table, pin_table);
-        total_hpwl = 0;
-        for (auto &kv : net2hpwl)
-            total_hpwl += kv.second;
 
         // 1) Global Swap
-        if (flag == true)
-        {
             bool imp_gs = global_swap_one_pass(
                 row_stripes, inst_table, net_table, inst2nets,
-                pin_table, width_dbu, max_row_delta, total_hpwl, net2hpwl, K_near_for_GS, x_w);
+                pin_table, width_dbu, max_row_delta, total_hpwl,
+                net2hpwl, K_near_for_GS, x_w, y2row_idx);
             improved_round |= imp_gs;
             cout << "[Iter " << iter << "][GS ] HPWL = " << total_hpwl << (imp_gs ? " (improved)" : "") << "\n";
             now = chrono::high_resolution_clock::now();
@@ -1867,15 +2074,13 @@ int main(int argc, char *argv[])
                 cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
                 break;
             }
-        }
 
-        if (flag1 == true)
-        {
+    
 
             // 2) Vertical Swap
             bool imp_vs = vertical_swap_one_pass(
                 row_stripes, inst_table, net_table, inst2nets,
-                pin_table, width_dbu, vs_k_neighbors, total_hpwl);
+                pin_table, width_dbu, vs_k_neighbors, total_hpwl, net2hpwl);
             improved_round |= imp_vs;
             cout << "[Iter " << iter << "][VS ] HPWL = " << total_hpwl << (imp_vs ? " (improved)" : "") << "\n";
             now = chrono::high_resolution_clock::now();
@@ -1885,12 +2090,6 @@ int main(int argc, char *argv[])
                 cout << " Time: " << chrono::duration_cast<chrono::milliseconds>(now - start).count() << endl;
                 break;
             }
-
-            net2hpwl = build_net2hpwl_cache(net_table, inst_table, pin_table);
-            total_hpwl = 0;
-            for (auto &kv : net2hpwl)
-                total_hpwl += kv.second;
-        }
         // 3) Local Reordering（window-3）
         bool imp_lr = false;
         for (auto &row : row_stripes)
@@ -1931,6 +2130,8 @@ int main(int argc, char *argv[])
             break;
         }
     }
+
+    print_global_swap_timers();
     // Refresh cache & recompute for consistency
     // cout<<"table 2"<<endl;
     net2hpwl = build_net2hpwl_cache(net_table, inst_table, pin_table);
@@ -1966,7 +2167,9 @@ int main(int argc, char *argv[])
     {
         cout << "OK last" << endl;
     }*/
-    rewrite_def_coords_only(argv[2], argv[3], inst_table, row_table);
+    string input_def = argv[2];
+    string output_def = argv[3];
+    rewrite_def_coords_only(input_def, output_def, inst_table, row_table);
 
     //----------記錄時間----------//
     auto end = high_resolution_clock::now();                  // 結束計時
